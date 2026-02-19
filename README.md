@@ -98,10 +98,6 @@ For backprop through time, pass `create_graph=True` to `step()` or `rollout()`. 
 
 * **Separate Analytical and Autograd Paths**: Refactor the `LangevinIntegrator` to use a high-performance analytical force path for standard rollouts, reserving the `create_graph=True` autograd pathway strictly for training and backpropagation through time.
 
-* **Neighbor List Caching**: Avoid recomputing `nonbonded_pairs` at every step. Reuse the neighbor list for 10–20 steps (with appropriate skin distance logic) to significantly accelerate rollouts in larger systems.
-
-* **`torch.compile` Optimization**: Integrate `torch.compile(model, mode="reduce-overhead")` to reduce Python interpreter latency and enable kernel fusion, which is often the dominant bottleneck for systems with fewer than ~1,000 nucleotides.
-
 * **Force Buffer Reuse**: Optimize the BAOAB integrator splitting to reuse forces computed at the end of one step as the initial forces for the next step, reducing redundant potential energy evaluations.
 
 * **Reduce Tensor Churn**: Pre-allocate memory for interaction site offsets and increase the use of in-place operations (e.g., `pos.add_`) during drift steps to reduce pressure on the PyTorch caching allocator.

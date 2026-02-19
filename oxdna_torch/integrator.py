@@ -53,7 +53,7 @@ def _torque_from_quat_grad(quaternions: Tensor, dEdq: Tensor) -> Tensor:
 
     So tau_i = -(dEdq · dq/dtheta_i), fully vectorized.
 
-    Fully vectorized — no Python loop. Verified against finite differences.
+    Fully vectorized - no Python loop. Verified against finite differences.
 
     Args:
         quaternions: (N, 4) unit quaternions [w, x, y, z]
@@ -161,23 +161,29 @@ class LangevinIntegrator(nn.Module):
         stochastic: bool = True,
         create_graph: bool = False,
     ) -> SystemState:
-        """Perform one inertial Langevin step.
+        """Perform one inertial Langevin step.  Returns the new SystemState."""
+        new_state, _ = self._step_with_forces(state, stochastic=stochastic,
+                                               create_graph=create_graph)
+        return new_state
 
-        Velocity-Verlet integration with Langevin thermostat kicks applied
-        at the half-steps (BAOAB splitting):
-          B: half-kick from force/torque
-          A: drift (position + orientation update)
-          O: Ornstein-Uhlenbeck (thermostat)
-          A: (implicit in next step's drift)
-          B: half-kick from force/torque
+    def _step_with_forces(
+        self,
+        state: SystemState,
+        stochastic: bool = True,
+        create_graph: bool = False,
+        _forces: Optional[Tuple[Tensor, Tensor]] = None,
+    ) -> Tuple[SystemState, Tuple[Tensor, Tensor]]:
+        """Like step(), but also returns forces at the new state for reuse.
 
         Args:
-            state: current SystemState (must have velocities and ang_velocities)
+            state: current SystemState
             stochastic: whether to apply Langevin noise
             create_graph: whether to build autograd graph (for BPTT)
+            _forces: (forces, torques) pre-computed at current state from the
+                     previous call - avoids one redundant energy evaluation.
 
         Returns:
-            New SystemState after one timestep
+            (new_state, (forces, torques)) at the new state
         """
         dt = self.dt
         positions = state.positions
@@ -195,8 +201,12 @@ class LangevinIntegrator(nn.Module):
         else:
             ang_momenta = state.ang_velocities  # stored as L (angular momentum)
 
-        # === Step 1: Compute forces/torques at current positions ===
-        forces, torques = self._compute_forces_and_torques(state, create_graph=create_graph)
+        # === Step 1: Forces/torques at current positions ===
+        # Reuse from previous step if provided (saves one energy evaluation per step)
+        if _forces is not None:
+            forces, torques = _forces
+        else:
+            forces, torques = self._compute_forces_and_torques(state, create_graph=create_graph)
 
         # === Step 2: First half-kick (B step) ===
         velocities = velocities + forces * (dt * 0.5 / self.mass)
@@ -210,7 +220,7 @@ class LangevinIntegrator(nn.Module):
             c1r, c2r = self._c1_rot, self._c2_rot
             ang_momenta = c1r * ang_momenta + c2r * torch.randn_like(ang_momenta)
 
-        # === Step 4: Drift (A step) — update positions and orientations ===
+        # === Step 4: Drift (A step) - update positions and orientations ===
         new_positions = positions + velocities * dt
 
         # Apply PBC wrapping to positions
@@ -242,13 +252,15 @@ class LangevinIntegrator(nn.Module):
             velocities = c1 * velocities + c2 * torch.randn_like(velocities)
             ang_momenta = c1r * ang_momenta + c2r * torch.randn_like(ang_momenta)
 
-        return SystemState(
+        new_state = SystemState(
             positions=new_positions,
             quaternions=new_quaternions,
             velocities=velocities,
             ang_velocities=ang_momenta,
             box=new_box,
         )
+        # Return forces at new positions - reused as step N+1's initial forces
+        return new_state, (new_forces, new_torques)
 
     def rollout(
         self,
@@ -303,9 +315,12 @@ class LangevinIntegrator(nn.Module):
                     trajectory.append(current_state)
         else:
             current_state = state
+            cached_forces = None  # carry forces from step N → step N+1
             for i in range(n_steps):
-                current_state = self.step(current_state, stochastic=stochastic,
-                                          create_graph=create_graph)
+                current_state, cached_forces = self._step_with_forces(
+                    current_state, stochastic=stochastic,
+                    create_graph=create_graph, _forces=cached_forces,
+                )
                 if (i + 1) % save_every == 0:
                     trajectory.append(current_state)
 
@@ -337,8 +352,11 @@ class LangevinIntegrator(nn.Module):
             box=box_actual,
         )
 
+        cached_forces = None
         for _ in range(n_steps):
-            state = self.step(state, stochastic=stochastic)
+            state, cached_forces = self._step_with_forces(
+                state, stochastic=stochastic, _forces=cached_forces
+            )
 
         return state
 
