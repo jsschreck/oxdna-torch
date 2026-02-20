@@ -24,12 +24,15 @@ Torque derivation from quaternion gradients:
   Verified against finite differences.
 """
 
+import math
+import os
+from pathlib import Path
+from typing import Optional, List, Tuple, Union
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
-from typing import Optional, List, Tuple
-import math
 
 from .state import SystemState
 from .model import OxDNAEnergy
@@ -130,22 +133,27 @@ class LangevinIntegrator(nn.Module):
         state: SystemState,
         create_graph: bool = False,
     ) -> Tuple[Tensor, Tensor]:
-        """Compute forces (N,3) and lab-frame torques (N,3) via autograd."""
-        pos_grad = state.positions.detach().requires_grad_(True)
-        quat_grad = state.quaternions.detach().requires_grad_(True)
+        """Compute forces (N,3) and lab-frame torques (N,3) via autograd.
 
-        state_grad = SystemState(
-            positions=pos_grad,
-            quaternions=quat_grad,
-            box=state.box,
-        )
+        Always runs with grad enabled internally (using enable_grad) so it
+        works correctly even when called from inside a torch.no_grad() block.
+        """
+        with torch.enable_grad():
+            pos_grad = state.positions.detach().requires_grad_(True)
+            quat_grad = state.quaternions.detach().requires_grad_(True)
 
-        energy = self.energy_model(state_grad)
+            state_grad = SystemState(
+                positions=pos_grad,
+                quaternions=quat_grad,
+                box=state.box,
+            )
 
-        grads = torch.autograd.grad(
-            energy, [pos_grad, quat_grad],
-            create_graph=create_graph,
-        )
+            energy = self.energy_model(state_grad)
+
+            grads = torch.autograd.grad(
+                energy, [pos_grad, quat_grad],
+                create_graph=create_graph,
+            )
 
         forces = -grads[0]   # (N, 3)  F = -dE/dpos
         dEdq = grads[1]      # (N, 4)  dE/dq (positive sign)
@@ -270,6 +278,13 @@ class LangevinIntegrator(nn.Module):
         checkpoint_every: int = 0,
         save_every: int = 1,
         create_graph: bool = False,
+        # --- file output (mirrors oxDNA input-file options) ---
+        trajectory_file: Optional[Union[str, Path]] = None,
+        lastconf_file: Optional[Union[str, Path]] = None,
+        energy_file: Optional[Union[str, Path]] = None,
+        print_conf_interval: int = 0,
+        print_energy_every: int = 0,
+        start_step: int = 0,
     ) -> List[SystemState]:
         """Integrate for multiple steps, returning trajectory.
 
@@ -279,12 +294,64 @@ class LangevinIntegrator(nn.Module):
             stochastic: whether to add Langevin noise
             checkpoint_every: if > 0, use gradient checkpointing every N steps
                 (saves memory at cost of recomputation during backward pass)
-            save_every: save state every N steps (1 = save all)
-            create_graph: build autograd graph for backprop through time
+            save_every: save state to the *in-memory* trajectory list every N
+                steps (1 = save all).  When save_every > 1 and
+                create_graph=True the intermediate (non-saved) steps run under
+                torch.no_grad(), so only saved steps carry the autograd graph.
+            create_graph: build autograd graph for backprop through time.
+                Only the saved states (every save_every steps) will have
+                gradients; intermediate burn-in steps are detached.
+            trajectory_file: if given, append a configuration frame to this
+                file every ``print_conf_interval`` steps (like oxDNA's
+                ``trajectory_file``).  The file is created / truncated at the
+                start of the run.
+            lastconf_file: if given, overwrite this file with the final
+                configuration at the end of the run (like oxDNA's
+                ``lastconf_file``).
+            energy_file: if given, append a one-line energy record every
+                ``print_energy_every`` steps (like oxDNA's ``energy_file``).
+                Format: ``step  Epot  Ekin  Etot`` (tab-separated).
+                The file is created / truncated at the start of the run.
+            print_conf_interval: write a trajectory frame every this many
+                steps.  Ignored when ``trajectory_file`` is None.
+                0 means never write (only ``lastconf_file`` is written).
+            print_energy_every: write an energy record every this many steps.
+                Ignored when ``energy_file`` is None.
+                0 means never write.
+            start_step: step counter offset written to conf headers and energy
+                files (useful when resuming a run).
 
         Returns:
-            List of SystemState snapshots along the trajectory
+            List of SystemState snapshots along the in-memory trajectory
         """
+        from .io import write_configuration
+
+        # ------------------------------------------------------------------ #
+        # File initialisation — truncate output files before the run starts   #
+        # ------------------------------------------------------------------ #
+        if trajectory_file is not None:
+            trajectory_file = Path(trajectory_file)
+            trajectory_file.open('w').close()   # truncate / create
+
+        if energy_file is not None:
+            energy_file = Path(energy_file)
+            with energy_file.open('w') as f:
+                f.write("# step\tEpot\tEkin\tEtot\n")
+
+        # ------------------------------------------------------------------ #
+        # Helper: compute scalar Epot and Ekin without building a graph        #
+        # ------------------------------------------------------------------ #
+        def _energies(s: SystemState):
+            with torch.no_grad():
+                epot = self.energy_model(s.detach()).item()
+            ekin = 0.0
+            if s.velocities is not None:
+                ekin = 0.5 * s.velocities.detach().pow(2).sum().item()
+            return epot, ekin
+
+        # ------------------------------------------------------------------ #
+        # Main integration loop                                                #
+        # ------------------------------------------------------------------ #
         trajectory = [state]
 
         if checkpoint_every > 0:
@@ -317,12 +384,79 @@ class LangevinIntegrator(nn.Module):
             current_state = state
             cached_forces = None  # carry forces from step N → step N+1
             for i in range(n_steps):
-                current_state, cached_forces = self._step_with_forces(
-                    current_state, stochastic=stochastic,
-                    create_graph=create_graph, _forces=cached_forces,
-                )
-                if (i + 1) % save_every == 0:
+                step = start_step + i + 1          # 1-indexed absolute step
+                is_save_step = (i + 1) % save_every == 0 or (i + 1) == n_steps
+
+                # Optimisation: when save_every > 1 and create_graph=True,
+                # run burn-in steps as pure inference (no graph) and only
+                # build the autograd graph on the saved step.  This avoids
+                # storing the full computational graph for every intermediate
+                # step.  When save_every == 1 we stay on the graph throughout
+                # (classic BPTT behaviour, unchanged).
+                if create_graph and save_every > 1:
+                    if is_save_step:
+                        # Detach so gradients don't flow through the
+                        # no_grad burn-in steps above.
+                        current_state = current_state.detach()
+                        cached_forces = None   # invalidate after detach
+                        current_state, cached_forces = self._step_with_forces(
+                            current_state, stochastic=stochastic,
+                            create_graph=True, _forces=cached_forces,
+                        )
+                    else:
+                        with torch.no_grad():
+                            current_state, cached_forces = self._step_with_forces(
+                                current_state, stochastic=stochastic,
+                                create_graph=False, _forces=cached_forces,
+                            )
+                else:
+                    # Default path: no special optimisation
+                    current_state, cached_forces = self._step_with_forces(
+                        current_state, stochastic=stochastic,
+                        create_graph=create_graph, _forces=cached_forces,
+                    )
+
+                if is_save_step:
                     trajectory.append(current_state)
+
+                # ---- file output ----------------------------------------- #
+                need_energy = (
+                    energy_file is not None
+                    and print_energy_every > 0
+                    and step % print_energy_every == 0
+                )
+                need_conf = (
+                    trajectory_file is not None
+                    and print_conf_interval > 0
+                    and step % print_conf_interval == 0
+                )
+
+                if need_energy or need_conf:
+                    epot, ekin = _energies(current_state)
+
+                    if need_energy:
+                        etot = epot + ekin
+                        with energy_file.open('a') as f:
+                            f.write(f"{step}\t{epot:.6f}\t{ekin:.6f}\t{etot:.6f}\n")
+
+                    if need_conf:
+                        write_configuration(
+                            trajectory_file, current_state,
+                            timestep=step, Epot=epot, Ekin=ekin,
+                            append=True,
+                        )
+
+        # ------------------------------------------------------------------ #
+        # lastconf: write final state unconditionally                          #
+        # ------------------------------------------------------------------ #
+        if lastconf_file is not None:
+            epot, ekin = _energies(current_state)
+            write_configuration(
+                lastconf_file, current_state,
+                timestep=start_step + n_steps,
+                Epot=epot, Ekin=ekin,
+                append=False,
+            )
 
         return trajectory
 

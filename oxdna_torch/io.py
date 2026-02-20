@@ -160,16 +160,26 @@ def read_configuration(
 def write_configuration(
     filepath: Union[str, Path],
     state: SystemState,
-    topology: Topology,
+    topology: Optional[Topology] = None,
     timestep: int = 0,
+    Epot: float = 0.0,
+    Ekin: float = 0.0,
+    append: bool = False,
 ) -> None:
     """Write an oxDNA configuration file.
+
+    The format is identical to the reference oxDNA binary output and can be
+    read back by both this library and the C++ oxDNA tools.
 
     Args:
         filepath: output path
         state: SystemState with positions and quaternions
-        topology: Topology for nucleotide count validation
-        timestep: simulation timestep to write
+        topology: optional Topology (used only for nucleotide count validation)
+        timestep: simulation timestep written to the header
+        Epot: potential energy written to the ``E =`` header line
+        Ekin: kinetic energy written to the ``E =`` header line
+        append: if True, append to an existing file (for trajectory files);
+                if False (default), overwrite / create the file
     """
     from .quaternion import quat_to_rotmat
 
@@ -193,10 +203,12 @@ def write_configuration(
     box = state.box.detach().cpu().numpy() if state.box is not None \
         else np.array([50.0, 50.0, 50.0])
 
-    with open(filepath, 'w') as f:
+    Etot = Epot + Ekin
+    mode = 'a' if append else 'w'
+    with open(filepath, mode) as f:
         f.write(f"t = {timestep}\n")
         f.write(f"b = {box[0]} {box[1]} {box[2]}\n")
-        f.write(f"E = 0 0 0\n")
+        f.write(f"E = {Epot} {Ekin} {Etot}\n")
 
         for i in range(state.n_nucleotides):
             parts = []
