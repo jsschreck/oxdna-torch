@@ -408,6 +408,16 @@ RNA_HYDR_EPS_SEQ = torch.tensor([
 RNA_CROSS_SEQ_K = torch.ones(4, 4, dtype=torch.float64)
 
 # ============================================================
+# Debye–Hückel electrostatics (oxRNA2)
+# Source: RNAInteraction2.cpp init()
+# These differ from DNA2: higher charge prefactor, slightly
+# longer Debye length prefactor.
+# ============================================================
+RNA2_DH_PREFACTOR    = 0.0858       # Q: charge strength (vs DNA2: 0.0543)
+RNA2_DH_LAMBDAFACTOR = 0.3667258    # lambda_0 at T_ref=300K, I=1M (vs DNA2: 0.3616455)
+RNA2_DH_T_REF        = 0.1          # reference temperature (300 K in oxDNA units)
+
+# ============================================================
 # Cutoff distance calculation for RNA
 # ============================================================
 def compute_rna_rcut() -> float:

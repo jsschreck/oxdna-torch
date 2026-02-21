@@ -1,15 +1,14 @@
 """
 OxRNA energy model.
 
-Implements the full oxRNA1 potential as a PyTorch nn.Module:
+Implements the oxRNA1 / oxRNA2 potential as a PyTorch nn.Module:
   E = E_FENE + E_bonded_excl + E_nonbonded_excl
     + E_stack + E_hbond + E_cross_stack + E_coaxial_stack
+    [+ E_debye_huckel       (oxRNA2, use_debye_huckel=True)]
+    [+ E_mismatch_repulsion (oxRNA2, mismatch_repulsion=True)]
 
-The model is a drop-in replacement for OxDNAEnergy when working with RNA:
-  - Uses RNATopology instead of Topology
-  - Computes all interactions with RNA-specific geometry and constants
-  - Compatible with LangevinIntegrator (same SystemState interface)
-  - Supports set_nl_skin(), set_nl_backend(), compile()
+Set use_debye_huckel=True to enable the oxRNA2 Debye–Hückel electrostatics
+(RNA2-specific Q=0.0858, lambda_0=0.3667258).
 
 Usage::
 
@@ -17,7 +16,8 @@ Usage::
     from oxdna_torch.rna_model import OxRNAEnergy
 
     topology, state = load_rna_system('hairpin.top', 'hairpin.conf')
-    model = OxRNAEnergy(topology, temperature=0.1113)
+    model = OxRNAEnergy(topology, temperature=0.1113,
+                        use_debye_huckel=True, salt_concentration=1.0)
     energy = model(state)
 """
 
@@ -39,10 +39,14 @@ from .interactions.rna_stacking import rna_stacking_energy
 from .interactions.rna_hbond import rna_hbond_energy
 from .interactions.rna_cross_stacking import rna_cross_stacking_energy
 from .interactions.rna_coaxial_stacking import rna_coaxial_stacking_energy
+from .interactions.rna_electrostatics import (
+    rna2_debye_huckel_params,
+    rna2_debye_huckel_energy,
+)
 
 
 class OxRNAEnergy(nn.Module):
-    """Full oxRNA1 potential energy as a differentiable nn.Module.
+    """oxRNA1 / oxRNA2 potential energy as a differentiable nn.Module.
 
     Args:
         topology:                    RNATopology object (connectivity + base types)
@@ -50,10 +54,14 @@ class OxRNAEnergy(nn.Module):
                                      (T_reduced = T_kelvin / 3000)
         seq_dependent:               if True, use sequence-dependent stacking/HB/
                                      cross-stacking parameters
-        mismatch_repulsion:          if True, add a repulsive bump for non-Watson-
-                                     Crick pairs (matches oxRNA2 mismatch_repulsion)
-        mismatch_repulsion_strength: strength of the mismatch repulsion (default 1.0);
-                                     corresponds to C++ mismatch_repulsion_strength
+        mismatch_repulsion:          if True, add repulsive bump for non-WC pairs
+                                     (oxRNA2 mismatch_repulsion option)
+        mismatch_repulsion_strength: strength of mismatch repulsion (default 1.0)
+        use_debye_huckel:            if True, add Debye–Hückel electrostatics using
+                                     oxRNA2 parameters (Q=0.0858, lambda_0=0.3667258)
+        salt_concentration:          molar salt for DH screening length (default 1.0 M,
+                                     as used in the oxRNA2 parameterisation paper)
+        dh_half_charged_ends:        if True (default), strand termini carry half charge
     """
 
     def __init__(
@@ -63,6 +71,9 @@ class OxRNAEnergy(nn.Module):
         seq_dependent: bool = True,
         mismatch_repulsion: bool = False,
         mismatch_repulsion_strength: float = 1.0,
+        use_debye_huckel: bool = False,
+        salt_concentration: float = 1.0,
+        dh_half_charged_ends: bool = True,
     ):
         super().__init__()
 
@@ -71,6 +82,24 @@ class OxRNAEnergy(nn.Module):
         self.seq_dependent = seq_dependent
         self.mismatch_repulsion = mismatch_repulsion
         self.mismatch_repulsion_strength = mismatch_repulsion_strength
+        self.use_debye_huckel = use_debye_huckel
+        self.salt_concentration = salt_concentration
+        self.dh_half_charged_ends = dh_half_charged_ends
+
+        # Pre-compute DH parameters (salt/T dependent scalars, not tensors)
+        if use_debye_huckel:
+            self._dh_params = rna2_debye_huckel_params(temperature, salt_concentration)
+        else:
+            self._dh_params = None
+
+        # Terminus mask: True for nucleotides at either end of a strand
+        terminus = torch.zeros(topology.n_nucleotides, dtype=torch.bool)
+        for i in range(topology.n_nucleotides):
+            n3 = topology.bonded_neighbors[i, 0].item()
+            n5 = topology.bonded_neighbors[i, 1].item()
+            if n3 == -1 or n5 == -1:
+                terminus[i] = True
+        self.register_buffer('terminus_mask', terminus)
 
         # Interaction cutoff
         self.cutoff: float = RC.compute_rna_rcut()
@@ -206,8 +235,15 @@ class OxRNAEnergy(nn.Module):
         e_cxst = rna_coaxial_stacking_energy(
             positions, quaternions, nbp, box)
 
+        e_dh = torch.tensor(0.0, dtype=positions.dtype, device=positions.device)
+        if self.use_debye_huckel:
+            e_dh = rna2_debye_huckel_energy(
+                positions, quaternions, nbp,
+                self.terminus_mask, self._dh_params, box,
+                half_charged_ends=self.dh_half_charged_ends)
+
         return (e_fene + e_bonded_excl + e_stack
-                + e_nonbonded_excl + e_hbond + e_cross + e_cxst)
+                + e_nonbonded_excl + e_hbond + e_cross + e_cxst + e_dh)
 
     def energy_components(self, state: SystemState) -> Dict[str, float]:
         """Return a dict of named energy components (for inspection/debugging).
@@ -261,6 +297,11 @@ class OxRNAEnergy(nn.Module):
                                   self.cross_k_table, box).item(),
             'coaxial_stack':  rna_coaxial_stacking_energy(
                                   positions, quaternions, nbp, box).item(),
+            'debye_huckel':   rna2_debye_huckel_energy(
+                                  positions, quaternions, nbp,
+                                  self.terminus_mask, self._dh_params, box,
+                                  half_charged_ends=self.dh_half_charged_ends,
+                              ).item() if self.use_debye_huckel else 0.0,
         }
         components['total'] = sum(components.values())
         return components

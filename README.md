@@ -12,7 +12,8 @@ A fully differentiable PyTorch reimplementation of the **oxDNA** and **oxRNA** c
 |-------|-------|-------------------|
 | **oxDNA1** | `OxDNAEnergy` | FENE, excl. vol., stacking, H-bond, cross-stacking, coaxial stacking |
 | **oxDNA2** | `OxDNAEnergy(use_oxdna2=True)` | All oxDNA1 terms + Debye–Hückel electrostatics + major/minor-groove geometry |
-| **oxRNA1** | `OxRNAEnergy` | RNA-specific FENE, excl. vol., stacking (asymmetric STACK_3/STACK_5 sites), H-bond, cross-stacking, coaxial stacking. Optional oxRNA2 mismatch repulsion via `mismatch_repulsion=True`. Debye–Hückel electrostatics (full oxRNA2) not yet implemented. |
+| **oxRNA1** | `OxRNAEnergy` | RNA-specific FENE, excl. vol., stacking (asymmetric STACK_3/STACK_5 sites), H-bond, cross-stacking, coaxial stacking |
+| **oxRNA2** | `OxRNAEnergy(use_debye_huckel=True, mismatch_repulsion=True)` | All oxRNA1 terms + Debye–Hückel electrostatics (Q=0.0858, λ₀=0.3667) + mismatch repulsion for non-WC pairs |
 
 All three models support:
 - **Sequence-averaged** or **sequence-dependent** stacking / H-bond parameters
@@ -141,6 +142,26 @@ final_state = trajectory[-1]
 ```
 
 The `examples/RNA_MD/` directory contains a 132-nucleotide single-stranded RNA snapshot (`prova.top` / `prova.dat`) generated with oxRNA2 MD at 25 °C, suitable for validation.
+
+## Quick Start — oxRNA2
+
+Enable the two oxRNA2 additions — Debye–Hückel electrostatics and mismatch repulsion — with two extra flags:
+
+```python
+model = OxRNAEnergy(
+    topology,
+    temperature=T_red,
+    seq_dependent=True,
+    # oxRNA2 additions:
+    use_debye_huckel=True,          # Debye–Hückel electrostatics (Q=0.0858)
+    salt_concentration=1.0,         # molar salt for screening length
+    dh_half_charged_ends=True,      # half charge at strand termini (default)
+    mismatch_repulsion=True,        # repulsive bump for non-WC pairs
+    mismatch_repulsion_strength=1.0,
+)
+```
+
+`energy_components()` reports all terms individually, including `debye_huckel` and `mismatch_repulsion`.
 
 ## Neighbour-List Backends
 
@@ -326,7 +347,8 @@ oxdna_torch/
     ├── rna_stacking.py          # RNA stacking (asymmetric STACK_3/STACK_5)
     ├── rna_hbond.py             # RNA hydrogen bonding
     ├── rna_cross_stacking.py    # RNA cross-stacking
-    └── rna_coaxial_stacking.py  # RNA coaxial stacking
+    ├── rna_coaxial_stacking.py  # RNA coaxial stacking
+    └── rna_electrostatics.py    # Debye–Hückel electrostatics (oxRNA2)
 examples/
 ├── pytorch_demo.py      # End-to-end DNA demo (energy, forces, dynamics, BPTT)
 ├── HAIRPIN/             # 18-nt DNA hairpin — topology, conf, input files
@@ -351,3 +373,4 @@ oxDNA uses its own reduced unit system:
 - Snodin, Randisi, Mosayebi, Šulc, Schreck, Romano, Ouldridge, Tsukanov, Nir, Louis, Doye, *J. Chem. Phys.* **142**, 234901 (2015) — oxDNA2
 - Šulc, Romano, Ouldridge, Doye, Louis, *J. Chem. Phys.* **140**, 235102 (2014) — oxRNA1
 - Matek, Šulc, Randisi, Doye, Louis, *J. Chem. Phys.* **143**, 243122 (2015) — oxRNA1 sequence-dependent parameters
+- Šulc, Romano, Ouldridge, Doye, Louis, *J. Chem. Phys.* **140**, 235102 (2014); Matek et al. *ibid.* **143**, 243122 (2015) — oxRNA2 mismatch repulsion and Debye–Hückel parameterisation

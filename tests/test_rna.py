@@ -166,7 +166,7 @@ def test_oxrna_energy_components():
     comps = model.energy_components(state)
     required_keys = {'fene', 'bonded_excl', 'stacking',
                      'nonbonded_excl', 'hbond', 'mismatch_repulsion',
-                     'cross_stacking', 'coaxial_stack', 'total'}
+                     'cross_stacking', 'coaxial_stack', 'debye_huckel', 'total'}
     assert required_keys == set(comps.keys())
     # Total should match sum of parts
     parts_sum = sum(v for k, v in comps.items() if k != 'total')
@@ -457,3 +457,110 @@ def test_rna_md_forces_autograd():
     assert not torch.isinf(pos.grad).any(),  "Force Infs detected"
     # Forces should be non-trivially large for a packed RNA
     assert pos.grad.norm() > 1.0, "Forces unexpectedly small"
+
+
+# ---------------------------------------------------------------------------
+# oxRNA2 Debye–Hückel electrostatics tests
+# ---------------------------------------------------------------------------
+
+class TestRNA2DebyeHuckel:
+    """Tests for use_debye_huckel=True (oxRNA2 electrostatics)."""
+
+    def test_dh_params_reasonable(self):
+        """DH parameters at 25°C and 1M salt should be physically sensible."""
+        from oxdna_torch.interactions.rna_electrostatics import rna2_debye_huckel_params
+        T_red = (273.15 + 25) / 3000.0
+        p = rna2_debye_huckel_params(T_red, salt_concentration=1.0)
+        # Debye length at 1M should be ~0.3 nm (in oxDNA units)
+        assert 0.2 < p['lambda_'] < 0.5, f"Unexpected lambda: {p['lambda_']}"
+        assert p['rc'] > p['rhigh'] > 0, "Cutoff hierarchy violated"
+        assert p['b'] > 0, "Smoothing coefficient B should be positive"
+
+    def test_dh_disabled_by_default(self):
+        """use_debye_huckel defaults to False; debye_huckel component is 0."""
+        topology, state = _make_linear_rna(4)
+        model = OxRNAEnergy(topology, temperature=0.1)
+        assert not model.use_debye_huckel
+        comps = model.energy_components(state)
+        assert comps['debye_huckel'] == 0.0
+
+    def test_dh_energy_nonzero_when_enabled(self):
+        """DH energy should be non-zero for a system with non-bonded pairs."""
+        topology, state = _make_linear_rna(8)  # 8 nts → non-bonded pairs exist
+        T_red = (273.15 + 25) / 3000.0
+        model_nodh = OxRNAEnergy(topology, temperature=T_red)
+        model_dh   = OxRNAEnergy(topology, temperature=T_red,
+                                  use_debye_huckel=True, salt_concentration=1.0)
+        e_nodh = model_nodh(state).item()
+        e_dh   = model_dh(state).item()
+        # DH adds a positive (repulsive) contribution at short range
+        assert e_dh != e_nodh, "DH energy should change total energy"
+        comps = model_dh.energy_components(state)
+        import math
+        assert math.isfinite(comps['debye_huckel'])
+
+    def test_dh_energy_increases_with_salt(self):
+        """Lower salt → longer Debye length → stronger/longer-range repulsion."""
+        topology, state = _make_linear_rna(8)
+        T_red = (273.15 + 25) / 3000.0
+        model_low  = OxRNAEnergy(topology, temperature=T_red,
+                                  use_debye_huckel=True, salt_concentration=0.1)
+        model_high = OxRNAEnergy(topology, temperature=T_red,
+                                  use_debye_huckel=True, salt_concentration=1.0)
+        dh_low  = model_low.energy_components(state)['debye_huckel']
+        dh_high = model_high.energy_components(state)['debye_huckel']
+        # Lower salt ⟹ weaker screening ⟹ larger DH energy
+        assert dh_low > dh_high, \
+            f"Lower salt should give more repulsion: {dh_low:.4f} vs {dh_high:.4f}"
+
+    def test_dh_components_sum_to_total(self):
+        """energy_components total must equal sum of parts with DH enabled."""
+        topology, state = _make_linear_rna(8)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topology, temperature=T_red,
+                             use_debye_huckel=True, salt_concentration=1.0)
+        comps = model.energy_components(state)
+        parts_sum = sum(v for k, v in comps.items() if k != 'total')
+        assert abs(comps['total'] - parts_sum) < 1e-10, \
+            f"Components don't sum to total: {parts_sum:.8f} vs {comps['total']:.8f}"
+
+    def test_dh_forces_finite(self):
+        """Autograd forces should be finite and non-NaN with DH enabled."""
+        topology, state = _make_linear_rna(8)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topology, temperature=T_red,
+                             use_debye_huckel=True, salt_concentration=1.0)
+        pos = state.positions.detach().requires_grad_(True)
+        s = SystemState(positions=pos, quaternions=state.quaternions.detach(), box=None)
+        model(s).backward()
+        assert not torch.isnan(pos.grad).any(), "NaN in DH forces"
+        assert not torch.isinf(pos.grad).any(), "Inf in DH forces"
+
+    @pytest.mark.skipif(not _rna_md_files_exist, reason='examples/RNA_MD files not found')
+    def test_dh_on_rna_md_snapshot(self):
+        """Full oxRNA2 (seq-dep + mismatch_repulsion + DH) on the 132-nt snapshot.
+
+        The C++ oxRNA2 energy is -1.3387 per nucleotide at salt=1M, T=25°C.
+        With all three oxRNA2 terms our value should be within 5% of this.
+        """
+        from oxdna_torch import load_rna_system, OxRNAEnergy
+
+        topo, state = load_rna_system(RNA_MD_TOP, RNA_MD_CONF)
+        T_red = (273.15 + 25) / 3000.0
+        model = OxRNAEnergy(topo, temperature=T_red, seq_dependent=True,
+                             mismatch_repulsion=True,
+                             use_debye_huckel=True, salt_concentration=1.0)
+        comps = model.energy_components(state)
+
+        # All terms finite
+        for name, val in comps.items():
+            assert math.isfinite(val), f"{name} is not finite: {val}"
+
+        # DH should be positive (repulsive) and non-trivial for a packed RNA
+        assert comps['debye_huckel'] > 0.0, "DH energy should be positive (repulsive)"
+
+        # Full oxRNA2 E/nt should be within 5% of the C++ reference -1.3387
+        e_per_nt = comps['total'] / topo.n_nucleotides
+        ref = -1.3387027012208
+        assert abs(e_per_nt - ref) / abs(ref) < 0.05, \
+            f"oxRNA2 E/nt={e_per_nt:.4f} more than 5% from reference {ref:.4f}"
